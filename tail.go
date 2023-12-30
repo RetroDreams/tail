@@ -2,15 +2,16 @@
 // Copyright (c) 2015 HPE Software Inc. All rights reserved.
 // Copyright (c) 2013 ActiveState Software Inc. All rights reserved.
 
-//nxadm/tail provides a Go library that emulates the features of the BSD `tail`
-//program. The library comes with full support for truncation/move detection as
-//it is designed to work with log rotation tools. The library works on all
-//operating systems supported by Go, including POSIX systems like Linux and
-//*BSD, and MS Windows. Go 1.9 is the oldest compiler release supported.
+// nxadm/tail provides a Go library that emulates the features of the BSD `tail`
+// program. The library comes with full support for truncation/move detection as
+// it is designed to work with log rotation tools. The library works on all
+// operating systems supported by Go, including POSIX systems like Linux and
+// *BSD, and MS Windows. Go 1.9 is the oldest compiler release supported.
 package tail
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,7 @@ type Line struct {
 	SeekInfo SeekInfo  // SeekInfo
 	Time     time.Time // Present time
 	Err      error     // Error from tail
+	Data     []byte
 }
 
 // Deprecated: this function is no longer used internally and it has little of no
@@ -46,7 +48,7 @@ type Line struct {
 //
 // NewLine returns a * pointer to a Line struct.
 func NewLine(text string, lineNum int) *Line {
-	return &Line{text, lineNum, SeekInfo{}, time.Now(), nil}
+	return &Line{text, lineNum, SeekInfo{}, time.Now(), nil, []byte{}}
 }
 
 // SeekInfo represents arguments to io.Seek. See: https://golang.org/pkg/io/#SectionReader.Seek
@@ -75,6 +77,7 @@ type Config struct {
 	MustExist bool      // Fail early if the file does not exist
 	Poll      bool      // Poll for file changes instead of using the default inotify
 	Pipe      bool      // The file is a named pipe (mkfifo)
+	Binary    bool      // Read as binary file
 
 	// Generic IO
 	Follow        bool // Continue looking for new lines (tail -f)
@@ -267,6 +270,30 @@ func (tail *Tail) readLine() (string, error) {
 	}
 }
 
+func (tail *Tail) readBinary() ([]byte, error) {
+	tail.lk.Lock()
+
+	var err error
+	totalBuf := &bytes.Buffer{}
+	b := make([]byte, 10240)
+	for {
+		n, err := tail.reader.Read(b)
+
+		if n > 0 {
+			data := b[:n]
+			//append
+			totalBuf.Write(data)
+		}
+
+		if err != nil {
+			break
+		}
+	}
+	tail.lk.Unlock()
+
+	return totalBuf.Bytes(), err
+}
+
 func (tail *Tail) tailFileSync() {
 	defer tail.Done()
 	defer tail.close()
@@ -304,17 +331,31 @@ func (tail *Tail) tailFileSync() {
 			}
 		}
 
-		line, err := tail.readLine()
+		var binData []byte
+		var line string
+		var err error
+
+		if tail.Binary {
+			binData, err = tail.readBinary()
+		} else {
+			line, err = tail.readLine()
+		}
 
 		// Process `line` even if err is EOF.
 		if err == nil {
-			cooloff := !tail.sendLine(line)
+			var cooloff bool
+
+			if tail.Binary {
+				cooloff = !tail.sendBinary(binData)
+			} else {
+				cooloff = !tail.sendLine(line)
+			}
 			if cooloff {
 				// Wait a second before seeking till the end of
 				// file when rate limit is reached.
 				msg := ("Too much log activity; waiting a second before resuming tailing")
 				offset, _ := tail.Tell()
-				tail.Lines <- &Line{msg, tail.lineNum, SeekInfo{Offset: offset}, time.Now(), errors.New(msg)}
+				tail.Lines <- &Line{msg, tail.lineNum, SeekInfo{Offset: offset}, time.Now(), errors.New(msg), []byte{}}
 				select {
 				case <-time.After(time.Second):
 				case <-tail.Dying():
@@ -454,7 +495,7 @@ func (tail *Tail) sendLine(line string) bool {
 		tail.lineNum++
 		offset, _ := tail.Tell()
 		select {
-		case tail.Lines <- &Line{line, tail.lineNum, SeekInfo{Offset: offset}, now, nil}:
+		case tail.Lines <- &Line{line, tail.lineNum, SeekInfo{Offset: offset}, now, nil, []byte{}}:
 		case <-tail.Dying():
 			return true
 		}
@@ -467,6 +508,16 @@ func (tail *Tail) sendLine(line string) bool {
 				tail.Filename)
 			return false
 		}
+	}
+
+	return true
+}
+
+func (tail *Tail) sendBinary(data []byte) bool {
+	now := time.Now()
+
+	if len(data) > 0 {
+		tail.Lines <- &Line{"", tail.lineNum, SeekInfo{}, now, nil, data}
 	}
 
 	return true
